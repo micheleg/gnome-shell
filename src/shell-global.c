@@ -89,6 +89,8 @@ struct _ShellGlobal {
   ca_context *sound_context;
 
   guint32 xdnd_timestamp;
+  Window xdnd_source;
+  Atom xdnd_action;
 
   gboolean has_modal;
   gboolean frame_timestamps;
@@ -123,6 +125,8 @@ enum
  XDND_POSITION_CHANGED,
  XDND_LEAVE,
  XDND_ENTER,
+ XDND_DROP,
+ XDND_DATA,
  NOTIFY_ERROR,
  LAST_SIGNAL
 };
@@ -377,13 +381,31 @@ shell_global_class_init (ShellGlobalClass *klass)
                     G_TYPE_NONE, 0);
 
   /* Emitted from gnome-shell-plugin.c during event handling */
+  shell_global_signals[XDND_DROP] =
+      g_signal_new ("xdnd-drop",
+                    G_TYPE_FROM_CLASS (klass),
+                    G_SIGNAL_RUN_LAST,
+                    0,
+                    NULL, NULL, NULL,
+                    G_TYPE_NONE, 0);
+
+  /* Emitted from gnome-shell-plugin.c during event handling */
   shell_global_signals[XDND_ENTER] =
       g_signal_new ("xdnd-enter",
                     G_TYPE_FROM_CLASS (klass),
                     G_SIGNAL_RUN_LAST,
                     0,
                     NULL, NULL, NULL,
-                    G_TYPE_NONE, 0);
+                    G_TYPE_NONE, 1, G_TYPE_STRV);
+
+  /* Emitted from gnome-shell-plugin.c during event handling */
+  shell_global_signals[XDND_DATA] =
+      g_signal_new ("xdnd-data",
+                    G_TYPE_FROM_CLASS (klass),
+                    G_SIGNAL_RUN_LAST,
+                    0,
+                    NULL, NULL, NULL,
+                    G_TYPE_NONE, 2, G_TYPE_STRING, G_TYPE_STRING);
 
   shell_global_signals[NOTIFY_ERROR] =
       g_signal_new ("notify-error",
@@ -1380,6 +1402,10 @@ void shell_global_init_xdnd (ShellGlobal *global)
   Window output_window = meta_get_overlay_window (global->meta_screen);
   long xdnd_version = 5;
 
+  global->xdnd_timestamp = 0;
+  global->xdnd_source = 0;
+  global->xdnd_action = None;
+
   XChangeProperty (global->xdisplay, global->stage_xwindow,
                    gdk_x11_get_xatom_by_name ("XdndAware"), XA_ATOM,
                    32, PropModeReplace, (const unsigned char *)&xdnd_version, 1);
@@ -1884,6 +1910,115 @@ shell_global_cancel_theme_sound (ShellGlobal *global,
 }
 
 /*
+ * Retrieves XDnD mime types as a string array.
+ */
+gchar **
+_shell_global_get_xdnd_mime_types (ShellGlobal         *global,
+                                   XClientMessageEvent *xclient)
+{
+  GPtrArray *array = g_ptr_array_new ();
+  Atom atom, *typelist;
+  int i, format;
+  unsigned long count, remaining, offset = 0;
+  unsigned char *data = NULL;
+
+  if (xclient->message_type != gdk_x11_get_xatom_by_name ("XdndEnter"))
+    {
+      g_warning ("XDnD: Cannot get mime type from %s",
+                 gdk_x11_get_xatom_name (xclient->message_type));
+
+      g_ptr_array_add (array, NULL);
+      return (gchar **) g_ptr_array_free (array, FALSE);
+    }
+
+  /* For up to three types. */
+  if ((xclient->data.l[1] & 1) == 0)
+    for (i = 2; i < 5; i++)
+      {
+        atom = xclient->data.l[i];
+
+        if (atom != None)
+          g_ptr_array_add(array, (gpointer) gdk_x11_get_xatom_name (atom));
+      }
+
+  /* There are more than three types, we need to use XdndTypeList. */
+  else
+    do
+      {
+        XGetWindowProperty (global->xdisplay, xclient->data.l[0],
+                            gdk_x11_get_xatom_by_name ("XdndTypeList"),
+                            offset, 0x8000000L, False, XA_ATOM,
+                            &atom, &format, &count, &remaining, &data);
+
+        if (atom == XA_ATOM && format == 32 && count != 0 && data)
+          {
+            typelist = (Atom *) data;
+
+            for (i = 0; i < count; i++)
+              g_ptr_array_add (array, (gpointer) gdk_x11_get_xatom_name (typelist[i]));
+
+            XFree (data);
+            offset += count;
+          }
+        else
+          {
+            g_warning("XDnD: Unable to get mime types");
+
+            if (data)
+              XFree (data);
+
+            break;
+          }
+      }
+    while (remaining != 0);
+
+  g_ptr_array_add (array, NULL);
+  return (gchar **) g_ptr_array_free (array, FALSE);
+}
+
+/*
+ * Returns data from an XDnD drop.
+ */
+GString *
+_shell_global_get_xdnd_selection_data (ShellGlobal *global,
+                                       Atom target)
+{
+  GString *str = g_string_new (NULL);
+  Atom atom;
+  int format;
+  unsigned long count, remaining, offset = 0;
+  unsigned char *data = NULL;
+
+  do
+    {
+      XGetWindowProperty (global->xdisplay, global->stage_xwindow,
+                          gdk_x11_get_xatom_by_name ("GnomeShellXdndSelection"),
+                          offset, 0x8000000L, True, target,
+                          &atom, &format, &count, &remaining, &data);
+
+      if (atom == target && format == 8 && count != 0 && data)
+        {
+          str = g_string_append_len (str, (gchar *) data, count);
+
+          XFree (data);
+          offset += count;
+        }
+      else
+        {
+          g_warning("XDnD: Unable to get selection data");
+
+          if (data)
+            XFree (data);
+
+          break;
+        }
+    }
+  while (remaining != 0);
+
+  return str;
+}
+
+/*
  * Process Xdnd events
  *
  * We pass the position and leave events to JS via a signal
@@ -1899,46 +2034,154 @@ gboolean _shell_global_check_xdnd_event (ShellGlobal  *global,
   if (xev->xany.window != output_window && xev->xany.window != global->stage_xwindow)
     return FALSE;
 
-  if (xev->xany.type == ClientMessage && xev->xclient.message_type == gdk_x11_get_xatom_by_name ("XdndPosition"))
+  if (xev->xany.type == ClientMessage &&
+      xev->xclient.message_type == gdk_x11_get_xatom_by_name ("XdndPosition"))
     {
-      XEvent xevent;
-      Window src = xev->xclient.data.l[0];
-
-      memset (&xevent, 0, sizeof(xevent));
-      xevent.xany.type = ClientMessage;
-      xevent.xany.display = global->xdisplay;
-      xevent.xclient.window = src;
-      xevent.xclient.message_type = gdk_x11_get_xatom_by_name ("XdndStatus");
-      xevent.xclient.format = 32;
-      xevent.xclient.data.l[0] = output_window;
-      /* flags: bit 0: will we accept the drop? bit 1: do we want more position messages */
-      xevent.xclient.data.l[1] = 2;
-      xevent.xclient.data.l[4] = None;
-
-      XSendEvent (global->xdisplay, src, False, 0, &xevent);
-
       /* Store the timestamp of the xdnd position event */
       global->xdnd_timestamp = xev->xclient.data.l[3];
+
       g_signal_emit_by_name (G_OBJECT (global), "xdnd-position-changed",
-                            (int)(xev->xclient.data.l[2] >> 16), (int)(xev->xclient.data.l[2] & 0xFFFF));
+                            (int)(xev->xclient.data.l[2] >> 16),
+                            (int)(xev->xclient.data.l[2] & 0xFFFF));
+
       global->xdnd_timestamp = 0;
 
       return TRUE;
     }
-   else if (xev->xany.type == ClientMessage && xev->xclient.message_type == gdk_x11_get_xatom_by_name ("XdndLeave"))
+  else if (xev->xany.type == ClientMessage &&
+           xev->xclient.message_type == gdk_x11_get_xatom_by_name ("XdndLeave"))
     {
       g_signal_emit_by_name (G_OBJECT (global), "xdnd-leave");
+      global->xdnd_source = 0;
 
       return TRUE;
     }
-   else if (xev->xany.type == ClientMessage && xev->xclient.message_type == gdk_x11_get_xatom_by_name ("XdndEnter"))
+  else if (xev->xany.type == ClientMessage &&
+           xev->xclient.message_type == gdk_x11_get_xatom_by_name ("XdndDrop"))
     {
-      g_signal_emit_by_name (G_OBJECT (global), "xdnd-enter");
+      XEvent xevent;
+
+      global->xdnd_timestamp = xev->xclient.data.l[2];
+
+      memset (&xevent, 0, sizeof(xevent));
+      xevent.xany.type = ClientMessage;
+      xevent.xany.display = global->xdisplay;
+      xevent.xclient.window = xev->xclient.data.l[0];
+      xevent.xclient.message_type = gdk_x11_get_xatom_by_name ("XdndFinished");
+      xevent.xclient.format = 32;
+      xevent.xclient.data.l[0] = output_window;
+      xevent.xclient.data.l[2] = global->xdnd_action;
+
+      if (global->xdnd_action != None)
+          xevent.xclient.data.l[1] = 1;
+
+      g_signal_emit_by_name (G_OBJECT (global), "xdnd-drop");
+      XSendEvent (global->xdisplay, xev->xclient.data.l[0], False, 0, &xevent);
+
+      global->xdnd_timestamp = 0;
+      global->xdnd_source = 0;
+
+      return TRUE;
+    }
+  else if (xev->xany.type == ClientMessage &&
+           xev->xclient.message_type == gdk_x11_get_xatom_by_name ("XdndEnter"))
+    {
+      gchar **mime_types;
+
+      global->xdnd_action = None;
+      global->xdnd_source = xev->xclient.data.l[0];
+
+      mime_types = _shell_global_get_xdnd_mime_types (global, &xev->xclient);
+      g_signal_emit_by_name (G_OBJECT (global), "xdnd-enter", mime_types);
+
+      /* Strings owned by GDK, free only the array. */
+      g_free(mime_types);
+
+      return TRUE;
+    }
+  else if (xev->xany.type == SelectionNotify &&
+           xev->xclient.message_type == gdk_x11_get_xatom_by_name ("XdndSelection") &&
+           xev->xselection.property == gdk_x11_get_xatom_by_name ("GnomeShellXdndSelection"))
+    {
+      const gchar *mime_type = gdk_x11_get_xatom_name (xev->xselection.target);
+      GString *data = _shell_global_get_xdnd_selection_data (global, xev->xselection.target);
+
+      global->xdnd_timestamp = xev->xselection.time;
+      g_signal_emit_by_name (G_OBJECT (global), "xdnd-data", mime_type, data->str);
+      global->xdnd_timestamp = 0;
+
+      g_string_free (data, TRUE);
 
       return TRUE;
     }
 
     return FALSE;
+}
+
+/**
+ * shell_global_set_xdnd_drag_status:
+ * @global: the #ShellGlobal
+ * @status: the drag status
+ *
+ * Informs the drag source about whether or not we accept the dragged items.
+ */
+void
+shell_global_set_xdnd_drag_status (ShellGlobal         *global,
+                                   ShellXdndDragStatus  status)
+{
+  Window output_window = meta_get_overlay_window (global->meta_screen);
+  XEvent xevent;
+
+  g_return_if_fail (global->xdnd_source != 0);
+  g_return_if_fail (global->xdnd_timestamp != 0);
+
+  memset (&xevent, 0, sizeof(xevent));
+  xevent.xany.type = ClientMessage;
+  xevent.xany.display = global->xdisplay;
+  xevent.xclient.window = global->xdnd_source;
+  xevent.xclient.message_type = gdk_x11_get_xatom_by_name ("XdndStatus");
+  xevent.xclient.format = 32;
+  xevent.xclient.data.l[0] = output_window;
+
+  switch (status)
+    {
+    case SHELL_XDND_DRAG_STATUS_COPY_DROP:
+      xevent.xclient.data.l[1] = 3;
+      global->xdnd_action = gdk_x11_get_xatom_by_name ("XdndActionCopy");
+      break;
+    case SHELL_XDND_DRAG_STATUS_MOVE_DROP:
+      xevent.xclient.data.l[1] = 3;
+      global->xdnd_action = gdk_x11_get_xatom_by_name ("XdndActionMove");
+      break;
+    default:
+      xevent.xclient.data.l[1] = 2;
+      global->xdnd_action = None;
+      break;
+    }
+
+  xevent.xclient.data.l[4] = global->xdnd_action;
+  XSendEvent (global->xdisplay, global->xdnd_source, False, 0, &xevent);
+}
+
+/**
+ * shell_global_request_xdnd_selection_data:
+ * @global: the #ShellGlobal
+ * @mime_type: the mime type of the data to request
+ *
+ * Requests information about a dragged item.
+ */
+void
+shell_global_request_xdnd_selection_data (ShellGlobal *global,
+                                          gchar       *mime_type)
+{
+  g_return_if_fail (global->xdnd_timestamp != 0);
+
+  XConvertSelection (global->xdisplay,
+                     gdk_x11_get_xatom_by_name ("XdndSelection"),
+                     gdk_x11_get_xatom_by_name (mime_type),
+                     gdk_x11_get_xatom_by_name ("GnomeShellXdndSelection"),
+                     global->stage_xwindow,
+                     global->xdnd_timestamp);
 }
 
 const char *

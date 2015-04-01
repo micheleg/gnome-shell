@@ -8,6 +8,13 @@ const Shell = imports.gi.Shell;
 const Signals = imports.signals;
 const DND = imports.ui.dnd;
 
+const DRAG_STATUS_MAP = {
+    0: Shell.XdndDragStatus.NO_DROP,
+    1: Shell.XdndDragStatus.COPY_DROP,
+    2: Shell.XdndDragStatus.MOVE_DROP,
+    3: Shell.XdndDragStatus.NO_DROP
+};
+
 const XdndHandler = new Lang.Class({
     Name: 'XdndHandler',
 
@@ -21,12 +28,21 @@ const XdndHandler = new Lang.Class({
         Main.uiGroup.add_actor(this._dummy);
         this._dummy.hide();
 
+        // Available mime types during XDnD.
+        this.mimeTypes = Array();
+
+        // Keeps information from xdnd-position-changed events for _onDrop and _onData.
+        this._pickedActor = null;
+        this._dragEvent = null;
+
         if (!Meta.is_wayland_compositor())
             global.init_xdnd();
 
         global.connect('xdnd-enter', Lang.bind(this, this._onEnter));
         global.connect('xdnd-position-changed', Lang.bind(this, this._onPositionChanged));
         global.connect('xdnd-leave', Lang.bind(this, this._onLeave));
+        global.connect('xdnd-drop', Lang.bind(this, this._onDrop));
+        global.connect('xdnd-data', Lang.bind(this, this._onData));
 
         this._windowGroupVisibilityHandlerId = 0;
     },
@@ -43,9 +59,12 @@ const XdndHandler = new Lang.Class({
         }
 
         this.emit('drag-end');
+        this.mimeTypes = Array();
     },
 
-    _onEnter: function() {
+    _onEnter: function(obj, mimeTypes) {
+        this.mimeTypes = mimeTypes;
+
         this._windowGroupVisibilityHandlerId  =
                 global.window_group.connect('notify::visible',
                     Lang.bind(this, this._onWindowGroupVisibilityChanged));
@@ -84,6 +103,9 @@ const XdndHandler = new Lang.Class({
     _onPositionChanged: function(obj, x, y) {
         let pickedActor = global.stage.get_actor_at_pos(Clutter.PickMode.REACTIVE, x, y);
 
+        this._pickedActor = null;
+        this._dragEvent = null;
+
         // Make sure that the cursor window is on top
         if (this._cursorWindowClone)
              this._cursorWindowClone.raise_top();
@@ -100,8 +122,10 @@ const XdndHandler = new Lang.Class({
             let motionFunc = DND.dragMonitors[i].dragMotion;
             if (motionFunc) {
                 let result = motionFunc(dragEvent);
-                if (result != DND.DragMotionResult.CONTINUE)
+                if (result != DND.DragMotionResult.CONTINUE) {
+                    global.set_xdnd_drag_status(DRAG_STATUS_MAP[result]);
                     return;
+                }
             }
         }
 
@@ -113,11 +137,60 @@ const XdndHandler = new Lang.Class({
                                                                       targX,
                                                                       targY,
                                                                       global.get_current_time());
-                    if (result != DND.DragMotionResult.CONTINUE)
+
+                    if (result != DND.DragMotionResult.CONTINUE) {
+                        this._dragEvent = dragEvent;
+                        this._pickedActor = pickedActor;
+                        global.set_xdnd_drag_status(DRAG_STATUS_MAP[result]);
                         return;
+                    }
                 }
                 pickedActor = pickedActor.get_parent();
         }
+
+        global.set_xdnd_drag_status(DRAG_STATUS_MAP[DND.DragMotionResult.NO_DROP]);
+    },
+
+    _onDrop: function(obj) {
+        let pickedActor = this._pickedActor;
+        let dragEvent = this._dragEvent;
+
+        if (pickedActor && dragEvent && pickedActor._delegate && pickedActor._delegate.acceptDrop) {
+            let [r, targX, targY] = pickedActor.transform_stage_point(dragEvent.x, dragEvent.y);
+            pickedActor._delegate.acceptDrop(this,
+                                             dragEvent.dragActor,
+                                             targX,
+                                             targY,
+                                             global.get_current_time());
+        }
+
+        this.emit('drag-end');
+        this.mimeTypes = Array();
+    },
+
+    _onData: function(obj, mimeType, data) {
+        let pickedActor = this._pickedActor;
+        let dragEvent = this._dragEvent;
+
+        if (pickedActor && dragEvent && pickedActor._delegate && pickedActor._delegate.acceptData) {
+            let [r, targX, targY] = pickedActor.transform_stage_point(dragEvent.x, dragEvent.y);
+            pickedActor._delegate.acceptData(this,
+                                             dragEvent.dragActor,
+                                             targX,
+                                             targY,
+                                             global.get_current_time(),
+                                             mimeType,
+                                             data);
+        }
+    },
+
+    requestData: function(delegate, mimeType) {
+        let pickedActor = this._pickedActor;
+
+        if (pickedActor && pickedActor._delegate == delegate && 0 <= this.mimeTypes.indexOf(mimeType))
+            global.request_xdnd_selection_data(mimeType);
+        else
+            throw new Error('Invalid XDnD data request');
     }
 });
 

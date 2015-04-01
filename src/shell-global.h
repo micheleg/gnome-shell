@@ -79,6 +79,20 @@ void shell_global_run_at_leisure (ShellGlobal          *global,
                                   gpointer              user_data,
                                   GDestroyNotify        notify);
 
+/* XDnD API */
+typedef enum {
+  SHELL_XDND_DRAG_STATUS_NO_DROP,
+  SHELL_XDND_DRAG_STATUS_COPY_DROP,
+  SHELL_XDND_DRAG_STATUS_MOVE_DROP,
+} ShellXdndDragStatus;
+
+void    shell_global_init_xdnd                   (ShellGlobal         *global);
+
+void    shell_global_set_xdnd_drag_status        (ShellGlobal         *global,
+                                                  ShellXdndDragStatus  status);
+
+void    shell_global_request_xdnd_selection_data (ShellGlobal         *global,
+                                                  gchar               *mime_type);
 
 /* Misc utilities / Shell API */
 void     shell_global_sync_pointer              (ShellGlobal  *global);
@@ -119,8 +133,6 @@ void     shell_global_cancel_theme_sound        (ShellGlobal  *global,
 void     shell_global_notify_error              (ShellGlobal  *global,
                                                  const char   *msg,
                                                  const char   *details);
-
-void     shell_global_init_xdnd                 (ShellGlobal  *global);
 
 void     shell_global_reexec_self               (ShellGlobal  *global);
 
